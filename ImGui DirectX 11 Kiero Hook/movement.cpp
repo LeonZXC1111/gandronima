@@ -10,6 +10,7 @@
 #include "trace.h"
 #include "schema.h"
 #include "jumpbug.h"
+#include "bhop.h"
 #include "kiero/minhook/include/MinHook.h"
 
 #include <Windows.h>
@@ -352,9 +353,11 @@ namespace
     }
 
     // =========================================================================
-    //  Jumpbug controller
+    //  Controllers
     // =========================================================================
     static jumpbug::Controller g_jb_controller;
+    static bhop::Controller    g_bhop_controller;
+    static std::int64_t        g_last_jump_tick = -1; // shared tracker for both features
 
     bool __fastcall hkCreateMove(void* pInput, std::uint32_t ssi, void* cmdArg)
     {
@@ -433,39 +436,27 @@ namespace
             ? rd<std::uint64_t>(cmd + cs2::usercmd::bt_value) : 0;
         const bool user_jump = (live_btns & cs2::buttons::IN_JUMP) != 0;
 
-        // --- BHOP ---
-        // Only auto-jump while the user actually holds JUMP (space). Without this
-        // gate it bunnyhops on its own the instant you touch ground, which is the
-        // "jumps by itself" bug. No engine prediction needed: on-ground + space ->
-        // jump this tick (live button + subtick), release in the air so the next
-        // ground contact is a fresh press edge.
-        if (bhop_on && user_jump)
-        {
-            bool  want = onground;
-            float when = 0.0f;
-            if (pr.valid) {
-                if (pr.will_land) {
-                    want = true;
-                    if (pr.land_frac > 0.0f && pr.land_frac < 1.0f) when = pr.land_frac;
-                }
-                if (pr.onground) want = true;
-            }
+        // =====================================================================
+        //  JUMPBUG (priority) + BHOP
+        //  Jumpbug runs first. If it decides to own the jump this tick,
+        //  bhop yields (jump_owned_elsewhere = true) so they never fight.
+        // =====================================================================
+        const int cmd_num = rd<int>(cmd + cs2::usercmd::cmd_number);
+        const std::int64_t tick_now = cmd_num;
+        bool jumpbug_owns = false;
 
-            if (want) {
-                button(cmd, pbtn, cs2::buttons::IN_JUMP, true);
-                add_subtick(base, cs2::buttons::IN_JUMP, when, true);
-                add_subtick(base, cs2::buttons::IN_JUMP, 1.0f, false);
-            }
-            else {
-                button(cmd, pbtn, cs2::buttons::IN_JUMP, false);
-            }
-        }
+        // Common motion data (shared by both controllers)
+        const auto scene = rd<std::uintptr_t>(pawn + schema::client::m_pGameSceneNode());
+        const auto vel = rd<trace::Vec3>(pawn + schema::client::m_vecVelocity());
+        trace::Vec3 org{};
+        if (aligned_ptr(scene))
+            org = rd<trace::Vec3>(scene + schema::client::m_vecAbsOrigin());
 
-        // --- JUMPBUG ---
+        // --- JUMPBUG first (higher priority) ---
         if (jb_on && !onground && falling && user_jump)
         {
             jumpbug::Frame frame{};
-            frame.command = rd<int>(cmd + cs2::usercmd::cmd_number);
+            frame.command = static_cast<std::uint32_t>(cmd_num);
             frame.readable = true;
             frame.enabled = true;
             frame.movement_allowed = true;
@@ -475,58 +466,146 @@ namespace
             frame.duck_held = (live_btns & cs2::buttons::IN_DUCK) != 0;
             frame.ducking = (flags & cs2::FL_DUCKING) != 0;
             frame.penalty = 0.2f;
-            frame.sim_time = static_cast<float>(frame.command) * (1.0f / 64.0f);
+            frame.sim_time = static_cast<float>(cmd_num) * (1.0f / 64.0f);
+            // duck_ready needs realistic values; 2.0 is default duck speed in CS2
             frame.duck_speed = 2.0f;
             frame.last_duck_time = 0.0f;
             frame.duck_interval = 0.0f;
+            if (g_last_jump_tick >= 0)
+                frame.last_jump_tick = g_last_jump_tick;
 
-            const auto scene = rd<std::uintptr_t>(pawn + schema::client::m_pGameSceneNode());
             jumpbug::Motion motion{};
-            if (aligned_ptr(scene)) {
-                const auto org = rd<trace::Vec3>(scene + schema::client::m_vecAbsOrigin());
-                motion.origin = { org.x, org.y, org.z };
-            }
-            const auto vel = rd<trace::Vec3>(pawn + schema::client::m_vecVelocity());
+            motion.origin = { org.x, org.y, org.z };
             motion.velocity = { vel.x, vel.y, vel.z };
-            motion.hull.mins = { -16.0f, -16.0f,  0.0f };
-            motion.hull.maxs = { 16.0f,  16.0f, 72.0f };
+            motion.hull.mins = { -16.0f, -16.0f, 0.0f };
+            motion.hull.maxs = {  16.0f,  16.0f, 72.0f };
             motion.gravity = 800.0f;
             motion.gravity_scale = 1.0f;
 
-            auto trace_fn = [pawn](jumpbug::Vec3 from, jumpbug::Vec3 to, jumpbug::Hull hull)
+            auto jb_trace = [pawn](jumpbug::Vec3 from, jumpbug::Vec3 to, jumpbug::Hull hull)
                 -> std::optional<jumpbug::Hit>
-                {
-                    if (!g_trace_ready_cache) return std::nullopt;
-                    const trace::Vec3 t_from{ from.x, from.y, from.z };
-                    const trace::Vec3 t_to{ to.x,   to.y,   to.z };
-                    const trace::Vec3 t_min{ hull.mins.x, hull.mins.y, hull.mins.z };
-                    const trace::Vec3 t_max{ hull.maxs.x, hull.maxs.y, hull.maxs.z };
-                    const auto r = trace::player_bbox(t_from, t_to, t_min, t_max,
-                        reinterpret_cast<void*>(pawn), 0x1C3003);
-                    if (r.fraction >= 1.0f || r.start_solid) return std::nullopt;
-                    jumpbug::Hit h{};
-                    h.fraction = r.fraction;
-                    h.normal = { r.normal.x, r.normal.y, r.normal.z };
-                    h.start_solid = r.start_solid;
-                    h.all_solid = r.all_solid;
-                    return h;
-                };
+            {
+                if (!g_trace_ready_cache) return std::nullopt;
+                const trace::Vec3 t_from{ from.x, from.y, from.z };
+                const trace::Vec3 t_to{ to.x, to.y, to.z };
+                const trace::Vec3 t_min{ hull.mins.x, hull.mins.y, hull.mins.z };
+                const trace::Vec3 t_max{ hull.maxs.x, hull.maxs.y, hull.maxs.z };
+                const auto r = trace::player_bbox(t_from, t_to, t_min, t_max,
+                    reinterpret_cast<void*>(pawn), 0x1C3003);
+                if (r.fraction >= 1.0f || r.start_solid) return std::nullopt;
+                jumpbug::Hit h{};
+                h.fraction = r.fraction;
+                h.normal = { r.normal.x, r.normal.y, r.normal.z };
+                h.start_solid = r.start_solid;
+                h.all_solid = r.all_solid;
+                return h;
+            };
 
-            auto writer_fn = [&](const jumpbug::Batch& b) -> bool {
+            auto jb_writer = [&](const jumpbug::Batch& b) -> bool {
+                // Drive both subticks AND live buttons so the engine sees the action
                 for (std::size_t i = 0; i < b.count; ++i) {
                     const auto& s = b.steps[i];
-                    std::uint64_t btn = (s.key == jumpbug::Key::duck)
+                    const std::uint64_t btn = (s.key == jumpbug::Key::duck)
                         ? cs2::buttons::IN_DUCK : cs2::buttons::IN_JUMP;
                     add_subtick(base, btn, s.when, s.down);
+                    // Also set live button state for the "down" events
+                    if (s.down)
+                        button(cmd, pbtn, btn, true);
                 }
                 return true;
-                };
+            };
 
-            g_jb_controller.run_with_prediction(
-                frame, motion, std::span<const jumpbug::NativeStep>{}, trace_fn, writer_fn);
+            const auto jb_res = g_jb_controller.run_with_prediction(
+                frame, motion, std::span<const jumpbug::NativeStep>{}, jb_trace, jb_writer);
+
+            jumpbug_owns = g_jb_controller.owns_jump();
+            if (jumpbug_owns)
+                g_last_jump_tick = tick_now;
         }
-        else if (onground && jb_on) {
+        else if (onground || !jb_on) {
             g_jb_controller.reset();
+        }
+
+        // --- BHOP (yields if jumpbug already owns the jump) ---
+        if (bhop_on && user_jump)
+        {
+            bhop::Frame frame{};
+            frame.command = static_cast<std::uint32_t>(cmd_num);
+            frame.tick = tick_now;
+            frame.readable = true;
+            frame.enabled = true;
+            frame.held = true;
+            frame.movement_allowed = true;
+            frame.grounded = onground;
+            frame.falling = falling;
+            frame.jump_owned_elsewhere = jumpbug_owns; // critical: yield to jumpbug
+            frame.penalty = 0.2f;
+
+            // Feed landing info carefully:
+            // - predicted_landing only when we are still in air and prediction says we will land this tick
+            // - landed only on the actual ground tick (age==0 logic in decide)
+            if (!onground && pr.valid && pr.will_land && pr.land_frac > 0.0f && pr.land_frac < 1.0f) {
+                frame.predicted_landing = bhop::Time{ tick_now, pr.land_frac };
+            }
+            if (onground) {
+                frame.landed = bhop::Time{ tick_now, 0.0f };
+            }
+
+            bhop::Motion motion{};
+            motion.origin = { org.x, org.y, org.z };
+            motion.velocity = { vel.x, vel.y, vel.z };
+            motion.hull.mins = { -16.0f, -16.0f, 0.0f };
+            motion.hull.maxs = {  16.0f,  16.0f, 72.0f };
+            motion.gravity = 800.0f;
+            motion.gravity_scale = 1.0f;
+            motion.standable_normal = 0.7f;
+
+            auto bhop_trace = [pawn](bhop::Vec3 from, bhop::Vec3 to, bhop::Hull hull)
+                -> std::optional<bhop::Hit>
+            {
+                if (!g_trace_ready_cache) return std::nullopt;
+                const trace::Vec3 t_from{ from.x, from.y, from.z };
+                const trace::Vec3 t_to{ to.x, to.y, to.z };
+                const trace::Vec3 t_min{ hull.mins.x, hull.mins.y, hull.mins.z };
+                const trace::Vec3 t_max{ hull.maxs.x, hull.maxs.y, hull.maxs.z };
+                const auto r = trace::player_bbox(t_from, t_to, t_min, t_max,
+                    reinterpret_cast<void*>(pawn), 0x1C3003);
+                if (r.fraction >= 1.0f || r.start_solid) return std::nullopt;
+                bhop::Hit h{};
+                h.fraction = r.fraction;
+                h.normal = { r.normal.x, r.normal.y, r.normal.z };
+                h.start_solid = r.start_solid;
+                h.all_solid = r.all_solid;
+                return h;
+            };
+
+            auto bhop_writer = [&](const bhop::Batch& batch) -> bool {
+                if (!batch.owns_jump)
+                    return true; // nothing to do (yielded or disabled)
+
+                // Fully own the button this tick
+                button(cmd, pbtn, cs2::buttons::IN_JUMP, false);
+
+                for (std::size_t i = 0; i < batch.count; ++i) {
+                    const auto& s = batch.steps[i];
+                    if (s.source < 0) {
+                        add_subtick(base, cs2::buttons::IN_JUMP, s.when, s.down);
+                        if (s.down)
+                            button(cmd, pbtn, cs2::buttons::IN_JUMP, true);
+                    }
+                }
+                if (!batch.jump_down)
+                    button(cmd, pbtn, cs2::buttons::IN_JUMP, false);
+                else
+                    g_last_jump_tick = tick_now;
+                return true;
+            };
+
+            g_bhop_controller.run_with_prediction(
+                frame, motion, std::span<const bhop::NativeStep>{}, bhop_trace, bhop_writer);
+        }
+        else if (!user_jump || !bhop_on) {
+            g_bhop_controller.reset();
         }
 
         // --- AUTOSTRAFE ---
