@@ -437,21 +437,32 @@ namespace
         const bool user_jump = (live_btns & cs2::buttons::IN_JUMP) != 0;
 
         // =====================================================================
-        //  SIMPLE RELIABLE BHOP
-        //  Does NOT need prediction or trace. Pure onground + hold space.
-        //  On ground  -> press jump (live + subtick @ 0)
-        //  In air     -> release jump (so next ground contact is a fresh edge)
+        //  SIMPLE RELIABLE BHOP (CS2 post-animgraph2 / subtick era)
+        //  - Space held detected via GetAsyncKeyState (not cmd bits — more reliable)
+        //  - onground via FL_ONGROUND | m_hGroundEntity
+        //  - On ground: force jump edge (live + subtick press @0, release @0.99)
+        //  - In air: force release so next landing is a fresh edge
+        //  CS2 needs a real press edge every landing; holding alone is not enough.
         // =====================================================================
-        if (bhop_on && user_jump)
         {
-            if (onground) {
-                button(cmd, pbtn, cs2::buttons::IN_JUMP, true);
-                add_subtick(base, cs2::buttons::IN_JUMP, 0.0f, true);
-                add_subtick(base, cs2::buttons::IN_JUMP, 0.99f, false);
-            }
-            else {
-                // Airborne: keep jump released so next ground contact is a fresh press
-                button(cmd, pbtn, cs2::buttons::IN_JUMP, false);
+            const bool space_held = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+            // backup ground check: m_hGroundEntity != invalid (0xFFFFFFFF)
+            const std::uint32_t ground_ent = rd<std::uint32_t>(pawn + 0x530); // m_hGroundEntity fallback
+            const bool on_ground = onground || (ground_ent != 0 && ground_ent != 0xFFFFFFFFu);
+
+            if (bhop_on && space_held)
+            {
+                if (on_ground) {
+                    // Fresh press edge this tick
+                    button(cmd, pbtn, cs2::buttons::IN_JUMP, true);
+                    add_subtick(base, cs2::buttons::IN_JUMP, 0.0f, true);
+                    add_subtick(base, cs2::buttons::IN_JUMP, 0.985f, false);
+                }
+                else {
+                    // Must release in air or spam penalty blocks the next hop
+                    button(cmd, pbtn, cs2::buttons::IN_JUMP, false);
+                    add_subtick(base, cs2::buttons::IN_JUMP, 0.0f, false);
+                }
             }
         }
 
